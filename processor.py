@@ -214,10 +214,17 @@ def process_data(
     selected_sources: list[str] | None = None,
     custom_sources: str = "",
     selected_groups: list[str] | None = None,
+    tracking_tag_filter_mode: str = "All tracking tags",
+    selected_tracking_tags: list[str] | None = None,
 ) -> dict[str, pd.DataFrame | dict[str, Any] | list[str]]:
     ttd_all = _prepare_ttd(ttd_df, mapping)
-    ttd_view_rows = ttd_all[ttd_all["is_ttd_view_row"]].copy()
-    ttd = ttd_all[~ttd_all["is_ttd_view_row"]].copy()
+    ttd_after_tracking, ttd_tracking_excluded = _apply_tracking_tag_filter(
+        ttd_all, tracking_tag_filter_mode, selected_tracking_tags or []
+    )
+    ttd_view_rows = ttd_after_tracking[ttd_after_tracking["is_ttd_view_row"]].copy()
+    ttd_after_view = ttd_after_tracking[~ttd_after_tracking["is_ttd_view_row"]].copy()
+    ttd_zero_revenue_rows = ttd_after_view[ttd_after_view["ttd_revenue_is_zero"]].copy()
+    ttd = ttd_after_view[~ttd_after_view["ttd_revenue_is_zero"]].copy()
     ga4 = _prepare_ga4(ga4_df, mapping)
 
     ga4_txn = _dedupe_ga4_transactions(ga4)
@@ -255,15 +262,31 @@ def process_data(
 
     summary = build_summary(matched_transactions, ga4_txn)
     campaign_mapping = build_campaign_mapping(ttd, raw_matched)
-    quality = build_data_quality(ttd, ga4, ga4_txn, raw_matched, mapping, len(ttd_all), len(ttd_view_rows))
+    quality = build_data_quality(
+        ttd,
+        ga4,
+        ga4_txn,
+        raw_matched,
+        mapping,
+        len(ttd_all),
+        len(ttd_tracking_excluded),
+        len(ttd_view_rows),
+        len(ttd_zero_revenue_rows),
+    )
     ttd_unmatched, ga4_unmatched = build_unmatched(ttd, ga4_txn, raw_matched)
     warnings = _build_warnings(mapping, ttd, ga4, date_source)
+    if len(ttd_tracking_excluded):
+        warnings.append(f"Excluded {len(ttd_tracking_excluded):,} TTD rows by Tracking Tag Name filter.")
     if len(ttd_view_rows):
         warnings.append(f"Excluded {len(ttd_view_rows):,} TTD rows containing ttd_view from all matching and summaries.")
+    if len(ttd_zero_revenue_rows):
+        warnings.append(f"Excluded {len(ttd_zero_revenue_rows):,} TTD rows where Monetary Value is 0.")
 
     return {
         "ttd_clean": ttd,
+        "ttd_tracking_excluded": ttd_tracking_excluded,
         "ttd_view_excluded": ttd_view_rows,
+        "ttd_zero_revenue_excluded": ttd_zero_revenue_rows,
         "ga4_clean": ga4,
         "summary": summary,
         "matched_transactions": _select_matched_columns(matched_transactions),
@@ -298,9 +321,20 @@ def _prepare_ttd(df: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFrame:
     ttd["ttd_conversion_time_parsed"] = parse_ttd_dates(ttd["ttd_conversion_time_raw"]) if time_col else pd.NaT
     ttd["ttd_revenue"] = clean_revenue(_series_or_blank(ttd, revenue_col)) if revenue_col else 0.0
     ttd["ttd_revenue_missing"] = _series_or_blank(ttd, revenue_col).map(is_missing_value) if revenue_col else True
+    ttd["ttd_revenue_is_zero"] = (~ttd["ttd_revenue_missing"]) & ttd["ttd_revenue"].eq(0)
     ttd["is_ttd_view_row"] = ttd.apply(row_contains_ttd_view, axis=1)
     ttd["attribution_group"] = ttd.apply(classify_ttd_row, axis=1)
     return ttd
+
+
+def _apply_tracking_tag_filter(
+    ttd: pd.DataFrame, filter_mode: str, selected_tracking_tags: list[str]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if filter_mode != "Selected tracking tags" or not selected_tracking_tags:
+        return ttd.copy(), ttd.iloc[0:0].copy()
+    selected = set(selected_tracking_tags)
+    mask = ttd["ttd_tracking_tag_name"].map(display_tracking_tag).isin(selected)
+    return ttd[mask].copy(), ttd[~mask].copy()
 
 
 def _prepare_ga4(df: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFrame:
@@ -430,6 +464,12 @@ def display_source_medium(value: Any) -> str:
     if text.lower() in {"(direct) / (none)", "web (direct)"}:
         return "Web (Direct)"
     return text
+
+
+def display_tracking_tag(value: Any) -> str:
+    if is_missing_value(value):
+        return "(missing tracking tag)"
+    return str(value).strip()
 
 
 def _dedupe_ga4_transactions(ga4: pd.DataFrame) -> pd.DataFrame:
@@ -653,7 +693,9 @@ def build_data_quality(
     raw_matched: pd.DataFrame,
     mapping: dict[str, str],
     ttd_raw_row_count: int,
+    ttd_tracking_excluded_count: int,
     ttd_view_excluded_count: int,
+    ttd_zero_revenue_excluded_count: int,
 ) -> pd.DataFrame:
     ttd_ids = set(ttd["ttd_transaction_id_norm"].dropna())
     ga4_ids = set(ga4["ga4_transaction_id_norm"].dropna())
@@ -661,9 +703,11 @@ def build_data_quality(
     discrepancy_count = _revenue_discrepancy_count(raw_matched)
 
     metrics = [
-        ("TTD raw rows before ttd_view exclusion", ttd_raw_row_count),
+        ("TTD raw rows before analysis filters", ttd_raw_row_count),
+        ("TTD rows excluded by Tracking Tag Name filter", ttd_tracking_excluded_count),
         ("TTD rows excluded because of ttd_view", ttd_view_excluded_count),
-        ("TTD rows used after ttd_view exclusion", len(ttd)),
+        ("TTD rows excluded because Monetary Value is 0", ttd_zero_revenue_excluded_count),
+        ("TTD rows used after analysis filters", len(ttd)),
         ("TTD rows with blank transaction ID", int(ttd["ttd_transaction_id_norm"].isna().sum())),
         ("TTD unique transaction IDs", len(ttd_ids)),
         ("GA4 raw rows", len(ga4)),
@@ -806,6 +850,13 @@ def source_options(ga4_df: pd.DataFrame, mapping: dict[str, str]) -> list[str]:
     if not source_col or source_col not in ga4_df.columns:
         return []
     return sorted(ga4_df[source_col].map(display_source_medium).dropna().unique().tolist())
+
+
+def tracking_tag_options(ttd_df: pd.DataFrame, mapping: dict[str, str]) -> list[str]:
+    tracking_col = _column_or_none(mapping.get("ttd_tracking"))
+    if not tracking_col or tracking_col not in ttd_df.columns:
+        return []
+    return sorted(ttd_df[tracking_col].map(display_tracking_tag).dropna().unique().tolist())
 
 
 def _build_warnings(

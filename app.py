@@ -12,6 +12,7 @@ from processor import (
     process_data,
     read_input_file,
     source_options,
+    tracking_tag_options,
 )
 
 
@@ -58,6 +59,8 @@ def main() -> None:
             selected_sources=filters["selected_sources"],
             custom_sources=filters["custom_sources"],
             selected_groups=filters["selected_groups"],
+            tracking_tag_filter_mode=filters["tracking_tag_filter_mode"],
+            selected_tracking_tags=filters["selected_tracking_tags"],
         )
 
     for warning in result["warnings"]:
@@ -151,6 +154,7 @@ def render_filters(ttd_df: pd.DataFrame, ga4_df: pd.DataFrame, mapping: dict[str
     st.subheader("3. Filters")
     dates = available_dates(ttd_df, ga4_df, mapping)
     source_values = source_options(ga4_df, mapping)
+    tracking_tag_values = tracking_tag_options(ttd_df, mapping)
 
     left, middle, right = st.columns(3)
     with left:
@@ -185,6 +189,20 @@ def render_filters(ttd_df: pd.DataFrame, ga4_df: pd.DataFrame, mapping: dict[str
             custom_sources = st.text_area("Custom source list", placeholder="One source per line or comma separated")
 
     selected_groups = st.multiselect("Attribution group filter", TTD_GROUPS, default=TTD_GROUPS)
+    tracking_tag_filter_mode = st.selectbox(
+        "TTD Tracking Tag Name filter",
+        ["All tracking tags", "Selected tracking tags"],
+    )
+    selected_tracking_tags: list[str] = []
+    if tracking_tag_filter_mode == "Selected tracking tags":
+        default_tags = [tag for tag in tracking_tag_values if tag.lower() == "care - one time donation"]
+        selected_tracking_tags = st.multiselect(
+            "Selected TTD tracking tags",
+            tracking_tag_values,
+            default=default_tags,
+        )
+        if not selected_tracking_tags:
+            st.warning("Select at least one Tracking Tag Name, or switch back to All tracking tags.")
 
     return {
         "revenue_source": revenue_source,
@@ -194,6 +212,8 @@ def render_filters(ttd_df: pd.DataFrame, ga4_df: pd.DataFrame, mapping: dict[str
         "selected_sources": selected_sources,
         "custom_sources": custom_sources,
         "selected_groups": selected_groups,
+        "tracking_tag_filter_mode": tracking_tag_filter_mode,
+        "selected_tracking_tags": selected_tracking_tags,
     }
 
 

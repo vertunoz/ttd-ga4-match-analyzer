@@ -37,6 +37,10 @@ TTD `Order Id` is matched to GA4 `Transaction ID` after normalization.
 
 Rows containing `ttd_view` in any TTD field are excluded before matching, summaries, campaign mapping, unmatched exports, and all calculated outputs. Data Quality shows how many rows were excluded.
 
+TTD rows where `Monetary Value` is present and cleans to `0` are also excluded before matching and summaries. Data Quality shows how many rows were removed by this rule.
+
+The UI includes a `TTD Tracking Tag Name filter`. Use it to limit the analysis to a specific conversion tag such as `Care - One Time Donation` before the matching starts.
+
 ## Attribution Groups
 
 TTD rows are classified into:
@@ -61,6 +65,8 @@ Detailed exports always include both:
 - `GA4 Purchase revenue`
 
 Revenue text is cleaned by removing currency symbols, commas, and whitespace before numeric conversion.
+
+Rows with a real zero TTD monetary value are removed from analysis before matching because they are not useful for transaction/donation revenue reporting.
 
 ## Deduplication
 
