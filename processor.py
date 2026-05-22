@@ -31,6 +31,23 @@ TTD_GROUPS = [
     "Mission Wired",
 ]
 
+BCU_GROUPS = [
+    "All",
+    "Prospecting",
+    "Remarketing",
+    "Retargeting",
+    "Other",
+]
+
+BCU_ATTRIBUTION_ORDER = [
+    "All",
+    "Prospecting",
+    "Remarketing",
+    "Retargeting",
+    "Other",
+    "Site",
+]
+
 
 @dataclass
 class LoadedFile:
@@ -69,6 +86,56 @@ def read_input_file(uploaded_file: Any, ga4_mode: bool = False) -> LoadedFile:
 
     df = pd.read_csv(io.BytesIO(raw), dtype=object, comment=None, low_memory=False)
     return LoadedFile(_clean_columns(df), metadata)
+
+
+def read_cm_file(uploaded_file: Any) -> LoadedFile:
+    file_name = getattr(uploaded_file, "name", "") or "cm_file"
+    raw = uploaded_file.getvalue()
+    suffix = file_name.lower().rsplit(".", 1)[-1] if "." in file_name else ""
+    metadata: dict[str, Any] = {
+        "file_name": file_name,
+        "skipped_rows": 0,
+        "header_row": 0,
+        "reader_notes": [],
+    }
+
+    if suffix in {"xlsx", "xls"}:
+        preview = pd.read_excel(io.BytesIO(raw), dtype=object, header=None)
+        rows = preview.fillna("").astype(str).values.tolist()
+        header_idx = _find_cm_header_row(rows)
+        metadata["header_row"] = header_idx
+        metadata["skipped_rows"] = header_idx
+        header = [str(cell).strip() for cell in rows[header_idx]]
+        data = preview.iloc[header_idx + 1 :].copy()
+        data.columns = header
+        return LoadedFile(_clean_columns(data.dropna(how="all").reset_index(drop=True)), metadata)
+
+    text = _decode_bytes(raw)
+    rows = list(csv.reader(io.StringIO(text)))
+    header_idx = _find_cm_header_row(rows)
+    metadata["header_row"] = header_idx
+    metadata["skipped_rows"] = header_idx
+    header = [str(cell).strip() for cell in rows[header_idx]]
+    records = [row for row in rows[header_idx + 1 :] if not _is_skip_row(row)]
+    width = len(header)
+    normalized_records = [
+        row[:width] + [None] * max(0, width - len(row)) if len(row) <= width else row[: width - 1] + ["".join(row[width - 1 :])]
+        for row in records
+    ]
+    return LoadedFile(_clean_columns(pd.DataFrame(normalized_records, columns=header)), metadata)
+
+
+def _find_cm_header_row(rows: list[list[Any]]) -> int:
+    for idx, row in enumerate(rows[:100]):
+        normalized = [_norm_col(cell) for cell in row]
+        if {"date", "activity", "campaign"}.issubset(set(normalized)) and (
+            "ord value" in normalized or "ordvalue" in normalized
+        ):
+            return idx
+    for idx, row in enumerate(rows[:100]):
+        if any(str(cell).strip().lower() == "report fields" for cell in row):
+            return idx + 1
+    return 0
 
 
 def _read_ga4_csv(raw: bytes) -> tuple[pd.DataFrame, int, int, list[str]]:
@@ -179,6 +246,16 @@ def detect_columns(ttd_df: pd.DataFrame, ga4_df: pd.DataFrame) -> dict[str, str]
         ),
         "ga4_revenue": _detect_column(ga4_df, ["Purchase revenue", "Revenue"], ["purchase", "revenue"]),
         "ga4_date": _detect_column(ga4_df, ["Date"], ["date"]),
+    }
+
+
+def detect_cm_columns(cm_df: pd.DataFrame) -> dict[str, str]:
+    return {
+        "cm_id": _detect_column(cm_df, ["ORD Value", "Order Id", "Order ID"], ["ord", "value"]),
+        "cm_campaign": _detect_column(cm_df, ["Campaign"], ["campaign"]),
+        "cm_activity": _detect_column(cm_df, ["Activity"], ["activity"]),
+        "cm_revenue": _detect_column(cm_df, ["Total Revenue", "Revenue"], ["revenue"]),
+        "cm_date": _detect_column(cm_df, ["Date"], ["date"]),
     }
 
 
@@ -300,6 +377,120 @@ def process_data(
     }
 
 
+def process_bcu_data(
+    ttd_df: pd.DataFrame,
+    cm_df: pd.DataFrame,
+    ga4_df: pd.DataFrame,
+    mapping: dict[str, str],
+    cm_mapping: dict[str, str],
+    revenue_source: str = "GA4 revenue",
+    period_mode: str = "Full period",
+    date_range: tuple[pd.Timestamp, pd.Timestamp] | None = None,
+    source_filter_mode: str = "All sources",
+    selected_sources: list[str] | None = None,
+    custom_sources: str = "",
+    selected_groups: list[str] | None = None,
+    tracking_tag_filter_mode: str = "All tracking tags",
+    selected_tracking_tags: list[str] | None = None,
+) -> dict[str, pd.DataFrame | dict[str, Any] | list[str]]:
+    ttd_all = _prepare_ttd(ttd_df, mapping)
+    ttd_all["attribution_group"] = ttd_all.apply(classify_bcu_media_row, axis=1)
+    ttd_after_tracking, ttd_tracking_excluded = _apply_tracking_tag_filter(
+        ttd_all, tracking_tag_filter_mode, selected_tracking_tags or []
+    )
+    ttd_view_rows = ttd_after_tracking[ttd_after_tracking["is_ttd_view_row"]].copy()
+    ttd_after_view = ttd_after_tracking[~ttd_after_tracking["is_ttd_view_row"]].copy()
+    ttd_zero_revenue_rows = ttd_after_view[ttd_after_view["ttd_revenue_is_zero"]].copy()
+    ttd = ttd_after_view[~ttd_after_view["ttd_revenue_is_zero"]].copy()
+
+    cm_all = _prepare_cm(cm_df, cm_mapping)
+    cm_zero_revenue_rows = cm_all[cm_all["cm_revenue_is_zero"]].copy()
+    cm = cm_all[~cm_all["cm_revenue_is_zero"]].copy()
+    ga4 = _prepare_ga4(ga4_df, mapping)
+    ga4_txn = _dedupe_ga4_transactions(ga4)
+
+    media_union, cm_overlap = build_bcu_media_union(ttd, cm)
+    raw_matched = media_union.merge(
+        ga4_txn,
+        left_on="media_transaction_id_norm",
+        right_on="ga4_transaction_id_norm",
+        how="inner",
+        suffixes=("", "_ga4"),
+    )
+    raw_matched["ttd_transaction_id_norm"] = raw_matched["media_transaction_id_norm"]
+
+    matched = raw_matched.copy()
+    matched["source_of_attribution"] = matched["attribution_group"]
+    matched_all = raw_matched.copy()
+    matched_all["source_of_attribution"] = "All"
+    matched_transactions = pd.concat([matched_all, matched], ignore_index=True)
+
+    selected_revenue_col = "ga4_revenue" if revenue_source == "GA4 revenue" else "media_revenue"
+    matched_transactions["selected_summary_revenue"] = matched_transactions[selected_revenue_col].fillna(0)
+    raw_matched["selected_summary_revenue"] = raw_matched[selected_revenue_col].fillna(0)
+
+    date_source = "TTD + CM Media Date" if media_union["ttd_conversion_time_parsed"].notna().any() else "GA4 Date"
+    matched_transactions = _assign_periods(matched_transactions, period_mode, "TTD Conversion Time")
+    raw_matched = _assign_periods(raw_matched, period_mode, "TTD Conversion Time")
+    ga4_txn = _assign_site_periods(ga4_txn, period_mode, date_source)
+
+    matched_transactions, raw_matched, ga4_txn = _apply_filters(
+        matched_transactions,
+        raw_matched,
+        ga4_txn,
+        date_range,
+        source_filter_mode,
+        selected_sources or [],
+        custom_sources,
+        selected_groups or BCU_GROUPS,
+    )
+
+    summary = build_summary(matched_transactions, ga4_txn, attribution_order=BCU_ATTRIBUTION_ORDER)
+    campaign_mapping = build_bcu_campaign_mapping(media_union, raw_matched)
+    ttd_unmatched, ga4_unmatched = build_bcu_unmatched(media_union, ga4_txn, raw_matched)
+    quality = build_bcu_data_quality(
+        ttd_all,
+        ttd,
+        cm_all,
+        cm,
+        ga4,
+        ga4_txn,
+        raw_matched,
+        len(ttd_tracking_excluded),
+        len(ttd_view_rows),
+        len(ttd_zero_revenue_rows),
+        len(cm_zero_revenue_rows),
+        media_union,
+        cm_overlap,
+    )
+    warnings = _build_warnings(mapping, ttd, ga4, date_source)
+    if len(ttd_tracking_excluded):
+        warnings.append(f"Excluded {len(ttd_tracking_excluded):,} TTD rows by Tracking Tag Name filter.")
+    if len(ttd_view_rows):
+        warnings.append(f"Excluded {len(ttd_view_rows):,} TTD rows containing ttd_view from all matching and summaries.")
+    if len(ttd_zero_revenue_rows):
+        warnings.append(f"Excluded {len(ttd_zero_revenue_rows):,} TTD rows where Monetary Value is 0.")
+    if len(cm_zero_revenue_rows):
+        warnings.append(f"Excluded {len(cm_zero_revenue_rows):,} CM rows where Total Revenue is 0.")
+
+    return {
+        "ttd_clean": ttd,
+        "cm_clean": cm,
+        "ga4_clean": ga4,
+        "summary": summary,
+        "matched_transactions": _select_bcu_matched_columns(matched_transactions),
+        "raw_matched_rows": raw_matched,
+        "campaign_mapping": campaign_mapping,
+        "data_quality": quality,
+        "ttd_unmatched": ttd_unmatched,
+        "ga4_unmatched": ga4_unmatched,
+        "date_source": date_source,
+        "warnings": warnings,
+        "bcu_ttd_cm_deduped": _select_bcu_union_columns(media_union),
+        "bcu_ttd_cm_overlap": cm_overlap,
+    }
+
+
 def _prepare_ttd(df: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFrame:
     ttd = df.copy()
     ttd["_ttd_row_number"] = range(1, len(ttd) + 1)
@@ -354,6 +545,28 @@ def _prepare_ga4(df: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFrame:
     ga4["ga4_date_raw"] = _series_or_blank(ga4, date_col)
     ga4["ga4_date_parsed"] = parse_ga4_dates(ga4["ga4_date_raw"]) if date_col else pd.NaT
     return ga4
+
+
+def _prepare_cm(df: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFrame:
+    cm = df.copy()
+    cm["_cm_row_number"] = range(1, len(cm) + 1)
+    id_col = _column_or_none(mapping.get("cm_id"))
+    campaign_col = _column_or_none(mapping.get("cm_campaign"))
+    activity_col = _column_or_none(mapping.get("cm_activity"))
+    revenue_col = _column_or_none(mapping.get("cm_revenue"))
+    date_col = _column_or_none(mapping.get("cm_date"))
+
+    cm["cm_transaction_id_raw"] = _series_or_blank(cm, id_col)
+    cm["cm_transaction_id_norm"] = cm["cm_transaction_id_raw"].map(normalize_transaction_id)
+    cm["cm_campaign_name"] = _series_or_blank(cm, campaign_col)
+    cm["cm_activity"] = _series_or_blank(cm, activity_col)
+    cm["cm_date_raw"] = _series_or_blank(cm, date_col)
+    cm["cm_date_parsed"] = parse_ga4_dates(cm["cm_date_raw"]) if date_col else pd.NaT
+    cm["cm_revenue"] = clean_revenue(_series_or_blank(cm, revenue_col)) if revenue_col else 0.0
+    cm["cm_revenue_missing"] = _series_or_blank(cm, revenue_col).map(is_missing_value) if revenue_col else True
+    cm["cm_revenue_is_zero"] = (~cm["cm_revenue_missing"]) & cm["cm_revenue"].eq(0)
+    cm["attribution_group"] = cm.apply(classify_bcu_media_row, axis=1)
+    return cm
 
 
 def _column_or_none(value: str | None) -> str | None:
@@ -442,6 +655,26 @@ def classify_ttd_row(row: pd.Series) -> str:
     if re.search(r"\bctv\b|video_ctv|connected\s*tv", text, flags=re.I):
         return "CTV"
     return "Always On"
+
+
+def classify_bcu_media_row(row: pd.Series) -> str:
+    fields = [
+        row.get("ttd_campaign_name", ""),
+        row.get("ttd_tracking_tag_name", ""),
+        row.get("ttd_conversion_referrer_url", ""),
+        row.get("ttd_conversion_id", ""),
+        row.get("Last Impression Ad Group Name", ""),
+        row.get("cm_campaign_name", ""),
+        row.get("cm_activity", ""),
+    ]
+    text = " ".join(str(value) for value in fields).lower()
+    if re.search(r"retargeting|retarget", text, flags=re.I):
+        return "Retargeting"
+    if re.search(r"remarketing|remarket|past-?donors|loyalty", text, flags=re.I):
+        return "Remarketing"
+    if re.search(r"prospecting|prospect|new-?donors|consideration", text, flags=re.I):
+        return "Prospecting"
+    return "Other"
 
 
 def row_contains_ttd_view(row: pd.Series) -> bool:
@@ -597,7 +830,11 @@ def _apply_filters(
     return matched, raw_matched, ga4_txn
 
 
-def build_summary(matched: pd.DataFrame, ga4_txn: pd.DataFrame) -> pd.DataFrame:
+def build_summary(
+    matched: pd.DataFrame,
+    ga4_txn: pd.DataFrame,
+    attribution_order: list[str] | None = None,
+) -> pd.DataFrame:
     site = (
         ga4_txn.groupby(["selected_period", "ga4_source_medium_display"], dropna=False)
         .agg(
@@ -643,9 +880,8 @@ def build_summary(matched: pd.DataFrame, ga4_txn: pd.DataFrame) -> pd.DataFrame:
     )
     site_mask = summary["Source of attribution"].eq("Site")
     summary.loc[site_mask, ["Share of total conversions", "Share of total revenue"]] = pd.NA
-    summary["Attribution Sort"] = summary["Source of attribution"].map(
-        {name: idx for idx, name in enumerate(ATTRIBUTION_ORDER)}
-    )
+    order = attribution_order or ATTRIBUTION_ORDER
+    summary["Attribution Sort"] = summary["Source of attribution"].map({name: idx for idx, name in enumerate(order)})
     summary = summary.sort_values(["Period", "Attribution Sort", "Conversions"], ascending=[True, True, False])
     return summary[
         [
@@ -768,6 +1004,147 @@ def build_unmatched(
     return ttd_unmatched, ga4_unmatched
 
 
+def build_bcu_media_union(ttd: pd.DataFrame, cm: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ttd_valid = ttd[ttd["ttd_transaction_id_norm"].notna()].copy()
+    cm_valid = cm[cm["cm_transaction_id_norm"].notna()].copy()
+    ttd_deduped = ttd_valid.sort_values("_ttd_row_number").drop_duplicates("ttd_transaction_id_norm", keep="first")
+    cm_deduped = cm_valid.sort_values("_cm_row_number").drop_duplicates("cm_transaction_id_norm", keep="first")
+
+    ttd_ids = set(ttd_deduped["ttd_transaction_id_norm"])
+    cm_ids = set(cm_deduped["cm_transaction_id_norm"])
+    overlap_ids = ttd_ids & cm_ids
+
+    ttd_union = ttd_deduped.copy()
+    ttd_union["media_transaction_id_norm"] = ttd_union["ttd_transaction_id_norm"]
+    ttd_union["media_transaction_id_raw"] = ttd_union["ttd_transaction_id_raw"]
+    ttd_union["media_source_status"] = ttd_union["media_transaction_id_norm"].map(
+        lambda value: "TTD + CM overlap" if value in overlap_ids else "TTD only"
+    )
+    ttd_union["media_platform"] = "TTD"
+    ttd_union["media_revenue"] = ttd_union["ttd_revenue"]
+
+    cm_only = cm_deduped[~cm_deduped["cm_transaction_id_norm"].isin(ttd_ids)].copy()
+    cm_union = pd.DataFrame(
+        {
+            "media_transaction_id_norm": cm_only["cm_transaction_id_norm"],
+            "media_transaction_id_raw": cm_only["cm_transaction_id_raw"],
+            "media_source_status": "CM only",
+            "media_platform": "CM",
+            "ttd_transaction_id_norm": cm_only["cm_transaction_id_norm"],
+            "ttd_transaction_id_raw": cm_only["cm_transaction_id_raw"],
+            "ttd_campaign_name": cm_only["cm_campaign_name"],
+            "ttd_tracking_tag_name": cm_only["cm_activity"],
+            "ttd_conversion_id": "",
+            "ttd_conversion_referrer_url": "",
+            "ttd_conversion_time_raw": cm_only["cm_date_raw"],
+            "ttd_conversion_time_parsed": cm_only["cm_date_parsed"],
+            "ttd_revenue": cm_only["cm_revenue"],
+            "media_revenue": cm_only["cm_revenue"],
+            "attribution_group": cm_only["attribution_group"],
+            "Last Impression Ad Group Name": "",
+            "Monetary Value Currency": "",
+        }
+    )
+
+    common_cols = sorted(set(ttd_union.columns) | set(cm_union.columns))
+    union = pd.concat(
+        [ttd_union.reindex(columns=common_cols), cm_union.reindex(columns=common_cols)],
+        ignore_index=True,
+    )
+    cm_overlap = cm_deduped[cm_deduped["cm_transaction_id_norm"].isin(overlap_ids)].copy()
+    return union, cm_overlap
+
+
+def build_bcu_campaign_mapping(media_union: pd.DataFrame, raw_matched: pd.DataFrame) -> pd.DataFrame:
+    matched_ids = set(raw_matched["media_transaction_id_norm"].dropna())
+    table = media_union.copy()
+    table["matched_flag"] = table["media_transaction_id_norm"].isin(matched_ids)
+    grouped = (
+        table.groupby(["ttd_campaign_name", "attribution_group", "media_source_status"], dropna=False)
+        .agg(
+            **{
+                "Raw TTD rows": ("media_transaction_id_norm", "count"),
+                "Unique transaction IDs": ("media_transaction_id_norm", "nunique"),
+                "Matched transactions": ("matched_flag", "sum"),
+                "Revenue": ("media_revenue", "sum"),
+                "Blank transaction ID rows": ("media_transaction_id_norm", lambda s: s.isna().sum()),
+            }
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "ttd_campaign_name": "Campaign name",
+                "attribution_group": "Assigned attribution group",
+                "media_source_status": "TTD / CM status",
+            }
+        )
+    )
+    return grouped.sort_values(["Assigned attribution group", "Raw TTD rows"], ascending=[True, False])
+
+
+def build_bcu_unmatched(
+    media_union: pd.DataFrame, ga4_txn: pd.DataFrame, raw_matched: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    matched_ids = set(raw_matched["media_transaction_id_norm"].dropna())
+    media_unmatched = media_union[
+        media_union["media_transaction_id_norm"].notna() & ~media_union["media_transaction_id_norm"].isin(matched_ids)
+    ].copy()
+    ga4_unmatched = ga4_txn[
+        ga4_txn["ga4_transaction_id_norm"].notna() & ~ga4_txn["ga4_transaction_id_norm"].isin(matched_ids)
+    ].copy()
+    return media_unmatched, ga4_unmatched
+
+
+def build_bcu_data_quality(
+    ttd_all: pd.DataFrame,
+    ttd_used: pd.DataFrame,
+    cm_all: pd.DataFrame,
+    cm_used: pd.DataFrame,
+    ga4: pd.DataFrame,
+    ga4_txn: pd.DataFrame,
+    raw_matched: pd.DataFrame,
+    ttd_tracking_excluded_count: int,
+    ttd_view_excluded_count: int,
+    ttd_zero_revenue_excluded_count: int,
+    cm_zero_revenue_excluded_count: int,
+    media_union: pd.DataFrame,
+    cm_overlap: pd.DataFrame,
+) -> pd.DataFrame:
+    ttd_ids = set(ttd_used["ttd_transaction_id_norm"].dropna())
+    cm_ids = set(cm_used["cm_transaction_id_norm"].dropna())
+    media_ids = set(media_union["media_transaction_id_norm"].dropna())
+    ga4_ids = set(ga4["ga4_transaction_id_norm"].dropna())
+    matched_ids = set(raw_matched["media_transaction_id_norm"].dropna())
+    metrics = [
+        ("TTD raw rows before analysis filters", len(ttd_all)),
+        ("TTD rows excluded by Tracking Tag Name filter", ttd_tracking_excluded_count),
+        ("TTD rows excluded because of ttd_view", ttd_view_excluded_count),
+        ("TTD rows excluded because Monetary Value is 0", ttd_zero_revenue_excluded_count),
+        ("TTD rows used after analysis filters", len(ttd_used)),
+        ("TTD unique transaction IDs after filters", len(ttd_ids)),
+        ("CM raw rows", len(cm_all)),
+        ("CM rows excluded because Total Revenue is 0", cm_zero_revenue_excluded_count),
+        ("CM rows used after analysis filters", len(cm_used)),
+        ("CM unique transaction IDs after filters", len(cm_ids)),
+        ("TTD and CM overlapping transaction IDs", len(ttd_ids & cm_ids)),
+        ("TTD only transaction IDs", len(ttd_ids - cm_ids)),
+        ("CM only transaction IDs", len(cm_ids - ttd_ids)),
+        ("Deduped TTD + CM unique transaction IDs", len(media_ids)),
+        ("GA4 raw rows", len(ga4)),
+        ("GA4 unique transaction IDs", len(ga4_ids)),
+        ("Matched deduped media transaction IDs in GA4", len(matched_ids)),
+        ("Match rate vs deduped TTD + CM IDs", _safe_rate(len(matched_ids), len(media_ids))),
+        ("Match rate vs GA4 unique transaction IDs", _safe_rate(len(matched_ids), len(ga4_ids))),
+        ("Deduped media IDs not found in GA4", len(media_ids - ga4_ids)),
+        ("GA4 IDs not found in deduped media", len(ga4_ids - media_ids)),
+        ("Duplicate TTD transaction IDs", int(ttd_used["ttd_transaction_id_norm"].duplicated().sum())),
+        ("Duplicate CM transaction IDs", int(cm_used["cm_transaction_id_norm"].duplicated().sum())),
+        ("CM overlap rows kept for audit", len(cm_overlap)),
+        ("GA4 rows available for Site denominator", len(ga4_txn)),
+    ]
+    return pd.DataFrame(metrics, columns=["Check", "Value"])
+
+
 def _select_matched_columns(df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "ttd_transaction_id_norm",
@@ -809,6 +1186,86 @@ def _select_matched_columns(df: pd.DataFrame) -> pd.DataFrame:
             "ga4_revenue": "GA4 Purchase revenue",
             "selected_summary_revenue": "Selected summary revenue",
             "selected_period": "Selected period",
+        }
+    )
+
+
+def _select_bcu_matched_columns(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "media_transaction_id_norm",
+        "media_transaction_id_raw",
+        "media_source_status",
+        "media_platform",
+        "ttd_campaign_name",
+        "source_of_attribution",
+        "ttd_tracking_tag_name",
+        "Last Impression Ad Group Name",
+        "ttd_conversion_time_raw",
+        "ttd_conversion_time_parsed",
+        "ga4_transaction_id_raw",
+        "ga4_date_raw",
+        "ga4_date_parsed",
+        "ga4_source_medium_raw",
+        "ga4_source_medium_display",
+        "media_revenue",
+        "ga4_revenue",
+        "selected_summary_revenue",
+        "selected_period",
+    ]
+    return df[[col for col in columns if col in df.columns]].rename(
+        columns={
+            "media_transaction_id_norm": "Normalized transaction ID",
+            "media_transaction_id_raw": "Raw media transaction ID",
+            "media_source_status": "TTD / CM status",
+            "media_platform": "Media platform kept",
+            "ttd_campaign_name": "Media campaign name",
+            "source_of_attribution": "Attribution group",
+            "ttd_tracking_tag_name": "Media tracking tag / activity",
+            "Last Impression Ad Group Name": "TTD ad group name",
+            "ttd_conversion_time_raw": "Media conversion date raw",
+            "ttd_conversion_time_parsed": "Media conversion date parsed",
+            "ga4_transaction_id_raw": "Raw GA4 Transaction ID",
+            "ga4_date_raw": "GA4 date raw",
+            "ga4_date_parsed": "GA4 date parsed",
+            "ga4_source_medium_raw": "GA4 source / medium raw",
+            "ga4_source_medium_display": "GA4 source / medium display",
+            "media_revenue": "Media revenue",
+            "ga4_revenue": "GA4 Purchase revenue",
+            "selected_summary_revenue": "Selected summary revenue",
+            "selected_period": "Selected period",
+        }
+    )
+
+
+def _select_bcu_union_columns(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "media_source_status",
+        "media_platform",
+        "media_transaction_id_norm",
+        "media_transaction_id_raw",
+        "ttd_campaign_name",
+        "attribution_group",
+        "ttd_tracking_tag_name",
+        "Last Impression Ad Group Name",
+        "ttd_conversion_time_raw",
+        "ttd_conversion_time_parsed",
+        "Monetary Value Currency",
+        "media_revenue",
+    ]
+    return df[[col for col in columns if col in df.columns]].rename(
+        columns={
+            "media_source_status": "TTD / CM status",
+            "media_platform": "Media platform kept",
+            "media_transaction_id_norm": "Normalized transaction ID",
+            "media_transaction_id_raw": "Raw transaction ID",
+            "ttd_campaign_name": "Campaign name",
+            "attribution_group": "Attribution group",
+            "ttd_tracking_tag_name": "Tracking tag / activity",
+            "Last Impression Ad Group Name": "TTD ad group name",
+            "ttd_conversion_time_raw": "Conversion date raw",
+            "ttd_conversion_time_parsed": "Conversion date parsed",
+            "Monetary Value Currency": "Currency",
+            "media_revenue": "Media revenue",
         }
     )
 

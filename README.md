@@ -23,6 +23,11 @@ Upload two offline files:
 
 CSV and Excel files are supported. GA4 CSV exports can include metadata rows, comment rows beginning with `#`, blank rows, and a `Grand total` row before or after the real table.
 
+Use the `Client / project` selector at the top of the app:
+
+- `CARE` uses the original TTD + GA4 workflow.
+- `BCU` adds a third CM weekly report upload and uses BCU-specific attribution groups.
+
 ## Matching Logic
 
 The app normalizes transaction IDs from both files before matching. It:
@@ -43,7 +48,7 @@ The UI includes a `TTD Tracking Tag Name filter`. Use it to limit the analysis t
 
 ## Attribution Groups
 
-TTD rows are classified into:
+For `CARE`, TTD rows are classified into:
 
 - `Mid Direct Mail`
 - `Direct Mail`
@@ -54,6 +59,32 @@ TTD rows are classified into:
 The `All` row is an aggregate across matched TTD transactions. Rules are case-insensitive and live in `processor.py` in `classify_ttd_row`.
 
 `Mid Direct Mail` is classified before `Direct Mail`, so Mid Direct Mail campaigns stay separate and do not fall into the regular Direct Mail group.
+
+For `BCU`, media rows are classified into:
+
+- `Prospecting`
+- `Remarketing`
+- `Retargeting`
+- `Other`
+
+BCU classification is based on campaign, ad group, tracking tag/activity text, and CM campaign/activity text.
+
+## BCU TTD + CM Deduplication
+
+For `BCU`, the app builds a deduped media transaction table before matching to GA4:
+
+- TTD rows are cleaned by tracking tag, `ttd_view`, zero monetary value, and missing transaction ID rules.
+- CM rows are read after the `Report Fields` metadata section and deduped by `ORD Value`.
+- If the same transaction ID exists in both TTD and CM, it is kept once using the TTD-shaped row and marked `TTD + CM overlap`.
+- TTD-only rows are marked `TTD only`.
+- CM-only rows are mapped into TTD-style columns and marked `CM only`.
+
+BCU exports include:
+
+- `BCU TTD CM Deduped`
+- `BCU TTD CM Overlap`
+
+The GA4 overlap summary for BCU uses the deduped TTD + CM media table.
 
 ## Revenue Logic
 

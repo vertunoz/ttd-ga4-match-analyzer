@@ -18,6 +18,7 @@ def build_excel_workbook(
     ttd_unmatched: pd.DataFrame,
     ga4_unmatched: pd.DataFrame,
     data_quality: pd.DataFrame,
+    extra_sheets: dict[str, pd.DataFrame] | None = None,
 ) -> bytes:
     output = io.BytesIO()
     sheets: dict[str, pd.DataFrame] = {
@@ -29,6 +30,8 @@ def build_excel_workbook(
         "GA4 Unmatched": ga4_unmatched,
         "Data Quality": data_quality,
     }
+    if extra_sheets:
+        sheets.update(extra_sheets)
 
     engine = "xlsxwriter" if _has_xlsxwriter() else "openpyxl"
     writer_kwargs = {"engine": engine}
