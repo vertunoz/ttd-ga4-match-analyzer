@@ -10,29 +10,8 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def build_excel_workbook(
-    summary: pd.DataFrame,
-    matched_transactions: pd.DataFrame,
-    raw_matched_rows: pd.DataFrame,
-    campaign_mapping: pd.DataFrame,
-    ttd_unmatched: pd.DataFrame,
-    ga4_unmatched: pd.DataFrame,
-    data_quality: pd.DataFrame,
-    extra_sheets: dict[str, pd.DataFrame] | None = None,
-) -> bytes:
+def build_named_excel_workbook(sheets: dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
-    sheets: dict[str, pd.DataFrame] = {
-        "Summary": summary,
-        "Matched Transactions": matched_transactions,
-        "Raw Matched Rows": raw_matched_rows,
-        "Campaign Mapping": campaign_mapping,
-        "TTD Unmatched": ttd_unmatched,
-        "GA4 Unmatched": ga4_unmatched,
-        "Data Quality": data_quality,
-    }
-    if extra_sheets:
-        sheets.update(extra_sheets)
-
     engine = "xlsxwriter" if _has_xlsxwriter() else "openpyxl"
     writer_kwargs = {"engine": engine}
     if engine == "xlsxwriter":
@@ -49,6 +28,31 @@ def build_excel_workbook(
                 _format_openpyxl_sheet(writer, safe_name, export_df)
 
     return output.getvalue()
+
+
+def build_excel_workbook(
+    summary: pd.DataFrame,
+    matched_transactions: pd.DataFrame,
+    raw_matched_rows: pd.DataFrame,
+    campaign_mapping: pd.DataFrame,
+    ttd_unmatched: pd.DataFrame,
+    ga4_unmatched: pd.DataFrame,
+    data_quality: pd.DataFrame,
+    extra_sheets: dict[str, pd.DataFrame] | None = None,
+) -> bytes:
+    sheets: dict[str, pd.DataFrame] = {
+        "Summary": summary,
+        "Matched Transactions": matched_transactions,
+        "Raw Matched Rows": raw_matched_rows,
+        "Campaign Mapping": campaign_mapping,
+        "TTD Unmatched": ttd_unmatched,
+        "GA4 Unmatched": ga4_unmatched,
+        "Data Quality": data_quality,
+    }
+    if extra_sheets:
+        sheets.update(extra_sheets)
+
+    return build_named_excel_workbook(sheets)
 
 
 def _has_xlsxwriter() -> bool:

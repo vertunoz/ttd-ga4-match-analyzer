@@ -491,6 +491,71 @@ def process_bcu_data(
     }
 
 
+def process_bcu_media_only(
+    ttd_df: pd.DataFrame,
+    cm_df: pd.DataFrame,
+    mapping: dict[str, str],
+    cm_mapping: dict[str, str],
+    period_mode: str = "Full period",
+    date_range: tuple[pd.Timestamp, pd.Timestamp] | None = None,
+    selected_groups: list[str] | None = None,
+    tracking_tag_filter_mode: str = "All tracking tags",
+    selected_tracking_tags: list[str] | None = None,
+) -> dict[str, pd.DataFrame | dict[str, Any] | list[str]]:
+    ttd_all = _prepare_ttd(ttd_df, mapping)
+    ttd_all["attribution_group"] = ttd_all.apply(classify_bcu_media_row, axis=1)
+    ttd_after_tracking, ttd_tracking_excluded = _apply_tracking_tag_filter(
+        ttd_all, tracking_tag_filter_mode, selected_tracking_tags or []
+    )
+    ttd_view_rows = ttd_after_tracking[ttd_after_tracking["is_ttd_view_row"]].copy()
+    ttd_after_view = ttd_after_tracking[~ttd_after_tracking["is_ttd_view_row"]].copy()
+    ttd_zero_revenue_rows = ttd_after_view[ttd_after_view["ttd_revenue_is_zero"]].copy()
+    ttd = ttd_after_view[~ttd_after_view["ttd_revenue_is_zero"]].copy()
+
+    cm_all = _prepare_cm(cm_df, cm_mapping)
+    cm_zero_revenue_rows = cm_all[cm_all["cm_revenue_is_zero"]].copy()
+    cm = cm_all[~cm_all["cm_revenue_is_zero"]].copy()
+
+    media_union, cm_overlap = build_bcu_media_union(ttd, cm)
+    media_union = _assign_periods(media_union, period_mode, "TTD Conversion Time")
+    media_union = _apply_bcu_media_only_filters(media_union, date_range, selected_groups or BCU_GROUPS)
+    cm_overlap = cm_overlap.copy()
+
+    quality = build_bcu_media_only_quality(
+        ttd_all,
+        ttd,
+        cm_all,
+        cm,
+        len(ttd_tracking_excluded),
+        len(ttd_view_rows),
+        len(ttd_zero_revenue_rows),
+        len(cm_zero_revenue_rows),
+        media_union,
+        cm_overlap,
+    )
+    campaign_mapping = build_bcu_campaign_mapping(media_union, media_union.iloc[0:0].copy())
+    warnings = []
+    if len(ttd_tracking_excluded):
+        warnings.append(f"Excluded {len(ttd_tracking_excluded):,} TTD rows by Tracking Tag Name filter.")
+    if len(ttd_view_rows):
+        warnings.append(f"Excluded {len(ttd_view_rows):,} TTD rows containing ttd_view from all BCU media outputs.")
+    if len(ttd_zero_revenue_rows):
+        warnings.append(f"Excluded {len(ttd_zero_revenue_rows):,} TTD rows where Monetary Value is 0.")
+    if len(cm_zero_revenue_rows):
+        warnings.append(f"Excluded {len(cm_zero_revenue_rows):,} CM rows where Total Revenue is 0.")
+
+    return {
+        "ttd_clean": ttd,
+        "cm_clean": cm,
+        "bcu_ttd_cm_deduped": _select_bcu_union_columns(media_union),
+        "bcu_ttd_cm_overlap": cm_overlap,
+        "campaign_mapping": campaign_mapping,
+        "data_quality": quality,
+        "date_source": "TTD + CM Media Date",
+        "warnings": warnings,
+    }
+
+
 def _prepare_ttd(df: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFrame:
     ttd = df.copy()
     ttd["_ttd_row_number"] = range(1, len(ttd) + 1)
@@ -1145,6 +1210,64 @@ def build_bcu_data_quality(
     return pd.DataFrame(metrics, columns=["Check", "Value"])
 
 
+def _apply_bcu_media_only_filters(
+    media_union: pd.DataFrame,
+    date_range: tuple[pd.Timestamp, pd.Timestamp] | None,
+    selected_groups: list[str],
+) -> pd.DataFrame:
+    output = media_union.copy()
+    if date_range:
+        start, end = date_range
+        start = pd.to_datetime(start).normalize()
+        end = pd.to_datetime(end).normalize()
+        output = output[output["analysis_date"].isna() | output["analysis_date"].between(start, end)]
+    selected = set(selected_groups)
+    if selected and "All" not in selected:
+        output = output[output["attribution_group"].isin(selected)]
+    elif selected:
+        allowed = selected - {"All"}
+        if allowed:
+            output = output[output["attribution_group"].isin(allowed)]
+    return output
+
+
+def build_bcu_media_only_quality(
+    ttd_all: pd.DataFrame,
+    ttd_used: pd.DataFrame,
+    cm_all: pd.DataFrame,
+    cm_used: pd.DataFrame,
+    ttd_tracking_excluded_count: int,
+    ttd_view_excluded_count: int,
+    ttd_zero_revenue_excluded_count: int,
+    cm_zero_revenue_excluded_count: int,
+    media_union: pd.DataFrame,
+    cm_overlap: pd.DataFrame,
+) -> pd.DataFrame:
+    ttd_ids = set(ttd_used["ttd_transaction_id_norm"].dropna())
+    cm_ids = set(cm_used["cm_transaction_id_norm"].dropna())
+    media_ids = set(media_union["media_transaction_id_norm"].dropna())
+    metrics = [
+        ("TTD raw rows before analysis filters", len(ttd_all)),
+        ("TTD rows excluded by Tracking Tag Name filter", ttd_tracking_excluded_count),
+        ("TTD rows excluded because of ttd_view", ttd_view_excluded_count),
+        ("TTD rows excluded because Monetary Value is 0", ttd_zero_revenue_excluded_count),
+        ("TTD rows used after analysis filters", len(ttd_used)),
+        ("TTD unique transaction IDs after filters", len(ttd_ids)),
+        ("CM raw rows", len(cm_all)),
+        ("CM rows excluded because Total Revenue is 0", cm_zero_revenue_excluded_count),
+        ("CM rows used after analysis filters", len(cm_used)),
+        ("CM unique transaction IDs after filters", len(cm_ids)),
+        ("TTD and CM overlapping transaction IDs", len(ttd_ids & cm_ids)),
+        ("TTD only transaction IDs", len(ttd_ids - cm_ids)),
+        ("CM only transaction IDs", len(cm_ids - ttd_ids)),
+        ("Deduped TTD + CM unique transaction IDs after filters", len(media_ids)),
+        ("Duplicate TTD transaction IDs", int(ttd_used["ttd_transaction_id_norm"].duplicated().sum())),
+        ("Duplicate CM transaction IDs", int(cm_used["cm_transaction_id_norm"].duplicated().sum())),
+        ("CM overlap rows kept for audit", len(cm_overlap)),
+    ]
+    return pd.DataFrame(metrics, columns=["Check", "Value"])
+
+
 def _select_matched_columns(df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "ttd_transaction_id_norm",
@@ -1297,6 +1420,27 @@ def available_dates(ttd_df: pd.DataFrame, ga4_df: pd.DataFrame, mapping: dict[st
     if dates.dropna().empty and ga4_date_col and ga4_date_col in ga4_df.columns:
         dates = parse_ga4_dates(ga4_df[ga4_date_col])
     dates = dates.dropna()
+    if dates.empty:
+        return None
+    return dates.min().normalize(), dates.max().normalize()
+
+
+def available_bcu_media_dates(
+    ttd_df: pd.DataFrame,
+    cm_df: pd.DataFrame,
+    mapping: dict[str, str],
+    cm_mapping: dict[str, str],
+) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    date_parts: list[pd.Series] = []
+    ttd_time_col = _column_or_none(mapping.get("ttd_time"))
+    cm_date_col = _column_or_none(cm_mapping.get("cm_date"))
+    if ttd_time_col and ttd_time_col in ttd_df.columns:
+        date_parts.append(parse_ttd_dates(ttd_df[ttd_time_col]))
+    if cm_date_col and cm_date_col in cm_df.columns:
+        date_parts.append(parse_ga4_dates(cm_df[cm_date_col]))
+    if not date_parts:
+        return None
+    dates = pd.concat(date_parts, ignore_index=True).dropna()
     if dates.empty:
         return None
     return dates.min().normalize(), dates.max().normalize()

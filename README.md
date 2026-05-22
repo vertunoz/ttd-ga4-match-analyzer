@@ -26,7 +26,12 @@ CSV and Excel files are supported. GA4 CSV exports can include metadata rows, co
 Use the `Client / project` selector at the top of the app:
 
 - `CARE` uses the original TTD + GA4 workflow.
-- `BCU` adds a third CM weekly report upload and uses BCU-specific attribution groups.
+- `BCU` adds CM support and BCU-specific attribution groups.
+
+BCU has two analysis modes:
+
+- `TTD + CM only`: upload only TTD and CM, dedupe the two media sources, and export unique rows plus overlap audit. GA4 is not required and GA4 date/source filters are hidden.
+- `TTD + CM -> GA4 overlap`: upload TTD, CM, and GA4, then compare the deduped media table against GA4.
 
 ## Matching Logic
 
