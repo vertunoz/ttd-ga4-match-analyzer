@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 
 from exporter import build_excel_workbook, dataframe_to_csv_bytes
-from processor import (
+from analysis_processor import (
     BCU_GROUPS,
     MISSING_OPTION,
     TTD_GROUPS,

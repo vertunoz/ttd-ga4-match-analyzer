@@ -56,7 +56,7 @@ For `CARE`, TTD rows are classified into:
 - `CTV`
 - `Always On`
 
-The `All` row is an aggregate across matched TTD transactions. Rules are case-insensitive and live in `processor.py` in `classify_ttd_row`.
+The `All` row is an aggregate across matched TTD transactions. Rules are case-insensitive and live in `analysis_processor.py` in `classify_ttd_row`.
 
 `Mid Direct Mail` is classified before `Direct Mail`, so Mid Direct Mail campaigns stay separate and do not fall into the regular Direct Mail group.
 
