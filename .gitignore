@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+*.xlsx
+*.csv
+data/
+uploads/
+exports/
+.streamlit/secrets.toml
